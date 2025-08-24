@@ -33,6 +33,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     pid_t katePid;
     BOOL embedded;
     NSTimer *windowSearchTimer;
+    NSTimer *processMonitorTimer;  // Add timer to monitor Kate process
     int searchAttempts;
     NSPoint lastPosition;
     NSSize lastSize;
@@ -57,6 +58,8 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 - (void)windowDidExpose:(NSNotification *)notification;
 - (void)handleWindowRestore;
 - (void)restoreKateWindowDelayed:(NSTimer *)timer;
+- (void)checkKateProcess:(NSTimer*)timer;  // Add method to check Kate process
+- (void)terminateKate;  // Add method to properly terminate Kate
 @end
 
 @implementation XEmbedView
@@ -68,6 +71,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         embedded = NO;
         searchAttempts = 0;
         kateWindow = 0;
+        katePid = 0;  // Initialize to 0
         isMinimized = NO;
         lastPosition = NSMakePoint(-1, -1);
         lastSize = NSMakeSize(0, 0);
@@ -99,6 +103,12 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     [super viewDidMoveToWindow];
     
     if ([self window]) {
+        // Register for window close notification
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(windowWillClose:)
+                                                     name:NSWindowWillCloseNotification
+                                                   object:[self window]];
+        
         // Register for live window movement notifications
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(windowIsMoving:)
@@ -148,6 +158,83 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
                                                  selector:@selector(windowDidExpose:)
                                                      name:NSWindowDidExposeNotification
                                                    object:[self window]];
+    }
+}
+
+- (void)windowWillClose:(NSNotification *)notification
+{
+    NSLog(@"Window will close - terminating our Kate instance (PID %d)", katePid);
+    [self terminateKate];
+}
+
+- (void)terminateKate
+{
+    // Stop timers first
+    if (windowSearchTimer) {
+        [windowSearchTimer invalidate];
+        [windowSearchTimer release];
+        windowSearchTimer = nil;
+    }
+    
+    if (processMonitorTimer) {
+        [processMonitorTimer invalidate];
+        [processMonitorTimer release];
+        processMonitorTimer = nil;
+    }
+    
+    // Only terminate our specific Kate process
+    if (katePid > 0) {
+        NSLog(@"Terminating our Kate instance (PID %d)", katePid);
+        
+        // First check if the process still exists
+        if (kill(katePid, 0) != 0) {
+            NSLog(@"Kate process %d already terminated", katePid);
+            katePid = 0;
+            return;
+        }
+        
+        // Send SIGTERM to just our Kate process
+        NSLog(@"Sending SIGTERM to Kate process %d", katePid);
+        kill(katePid, SIGTERM);
+        
+        // Give it time to terminate gracefully
+        int waitCount = 0;
+        while (waitCount < 10) { // Wait up to 1 second
+            usleep(100000); // 100ms
+            
+            // Check if process still exists
+            if (kill(katePid, 0) != 0) {
+                // Process is gone
+                NSLog(@"Kate terminated gracefully");
+                break;
+            }
+            waitCount++;
+        }
+        
+        // If still running, force kill
+        if (kill(katePid, 0) == 0) {
+            NSLog(@"Kate didn't terminate gracefully, sending SIGKILL to PID %d", katePid);
+            kill(katePid, SIGKILL);
+        }
+        
+        // Wait for the process to actually terminate
+        int status;
+        pid_t result = waitpid(katePid, &status, WNOHANG);
+        
+        if (result == 0) {
+            // Still running somehow, do a blocking wait with timeout
+            alarm(2); // Set 2 second timeout
+            result = waitpid(katePid, &status, 0);
+            alarm(0); // Cancel alarm
+        }
+        
+        if (result > 0) {
+            NSLog(@"Kate process %d reaped successfully (status: %d)", katePid, status);
+        } else if (result < 0) {
+            NSLog(@"Warning: Could not reap Kate process %d: %s", katePid, strerror(errno));
+        }
+        
+        katePid = 0;
     }
 }
 
@@ -451,14 +538,8 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     
-    if (windowSearchTimer) {
-        [windowSearchTimer invalidate];
-        [windowSearchTimer release];
-    }
-    if (katePid > 0) {
-        kill(katePid, SIGTERM);
-        waitpid(katePid, NULL, 0);
-    }
+    [self terminateKate];  // Use the centralized termination method
+    
     if (display && containerWindow) {
         XDestroyWindow(display, containerWindow);
     }
@@ -483,6 +564,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     if (katePid == 0) {
         // Child process
         
+        // Don't create a new process group - this would affect child windows
+        // setpgid(0, 0);  // REMOVED
+        
         // Set environment to encourage embedding
         char windowId[32];
         snprintf(windowId, sizeof(windowId), "%lu", containerWindow);
@@ -495,11 +579,17 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         setenv("GTK_CSD", "0", 1);
         setenv("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1", 1);
         
-        // Launch Kate
+        // Reset signal handlers to default
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        
+        // Launch Kate with better arguments for embedding
         char *args[] = {
             "kate",
-            "--desktopfile", "kate",
-            NULL
+            "-n",  // Start a new kate instance (short for --new)
+            "-b",  // Block - don't detach from terminal (important for process tracking)
+            NULL   // Removed --desktopfile as it might interfere
         };
         
         execvp("kate", args);
@@ -511,12 +601,65 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     } else {
         NSLog(@"Launched Kate with PID: %d", katePid);
         
+        // Don't set process group from parent either
+        // setpgid(katePid, katePid);  // REMOVED
+        
         // Start searching for Kate's window after a delay
         windowSearchTimer = [[NSTimer scheduledTimerWithTimeInterval:0.1
                                                                target:self
                                                              selector:@selector(searchForKateWindow:)
                                                              userInfo:nil
                                                               repeats:YES] retain];
+        
+        // Start monitoring Kate process
+        processMonitorTimer = [[NSTimer scheduledTimerWithTimeInterval:0.5
+                                                                 target:self
+                                                               selector:@selector(checkKateProcess:)
+                                                               userInfo:nil
+                                                                repeats:YES] retain];
+    }
+}
+
+- (void)checkKateProcess:(NSTimer*)timer
+{
+    if (katePid <= 0) {
+        return;
+    }
+    
+    // Check if Kate process is still running
+    if (kill(katePid, 0) != 0) {
+        // Process no longer exists
+        NSLog(@"Kate process (PID %d) has terminated", katePid);
+        
+        // Stop monitoring
+        [timer invalidate];
+        if (processMonitorTimer == timer) {
+            [processMonitorTimer release];
+            processMonitorTimer = nil;
+        }
+        
+        katePid = 0;
+        embedded = NO;
+        kateWindow = 0;
+        
+        // Close the wrapper window
+        [[self window] performClose:nil];
+    } else {
+        // Also check if Kate window still exists
+        if (kateWindow && embedded) {
+            XWindowAttributes attrs;
+            suppressErrors = YES;
+            if (!XGetWindowAttributes(display, kateWindow, &attrs)) {
+                // Window no longer exists
+                NSLog(@"Kate window destroyed but process still running");
+                embedded = NO;
+                kateWindow = 0;
+                
+                // Try to find it again
+                [self findAndEmbedKateWindow];
+            }
+            suppressErrors = NO;
+        }
     }
 }
 
@@ -630,7 +773,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     XWindowAttributes attrs;
     XGetWindowAttributes(display, kateWindow, &attrs);
     
-    // Select events on Kate window
+    // Select events on Kate window - add DestroyNotify to detect when Kate closes
     XSelectInput(display, kateWindow,
                 StructureNotifyMask | PropertyChangeMask | FocusChangeMask);
     
@@ -787,7 +930,12 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     while (XPending(display)) {
         XEvent event;
         XNextEvent(display, &event);
-        // Process events silently
+        
+        // Check for DestroyNotify events on Kate window
+        if (event.type == DestroyNotify) {
+            NSLog(@"Received DestroyNotify event for window %lu", event.xdestroywindow.window);
+            // The process monitor will handle closing the wrapper
+        }
     }
 }
 
