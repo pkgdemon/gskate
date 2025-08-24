@@ -849,8 +849,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     XGetWindowAttributes(display, kateWindow, &attrs);
     
     // Select events on Kate window - add DestroyNotify to detect when Kate closes
+    // Remove FocusChangeMask to prevent focus events from Kate
     XSelectInput(display, kateWindow,
-                StructureNotifyMask | PropertyChangeMask | FocusChangeMask | SubstructureNotifyMask);
+                StructureNotifyMask | PropertyChangeMask | SubstructureNotifyMask);
     
     // Unmap the window first
     XUnmapWindow(display, kateWindow);
@@ -865,7 +866,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     // Don't set override redirect on Kate window - let it cooperate with WM
     XSetWindowAttributes sattr;
     sattr.override_redirect = False;
-    XChangeWindowAttributes(display, kateWindow, CWOverrideRedirect, &sattr);
+    // Disable focus for Kate window to prevent it from stealing focus
+    sattr.do_not_propagate_mask = FocusChangeMask;
+    XChangeWindowAttributes(display, kateWindow, CWOverrideRedirect | CWDontPropagate, &sattr);
     
     // Reparent Kate window into our container
     XReparentWindow(display, kateWindow, containerWindow, 0, 0);
@@ -888,8 +891,8 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     XUngrabServer(display);
     XSync(display, False);
     
-    // Give focus to Kate
-    XSetInputFocus(display, kateWindow, RevertToParent, CurrentTime);
+    // Don't give focus to Kate - keep it with GNUstep
+    // XSetInputFocus(display, kateWindow, RevertToParent, CurrentTime);
     
     // Now set override_redirect on container to make it borderless
     sattr.override_redirect = True;
@@ -916,9 +919,16 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     return YES;
 }
 
+- (BOOL)becomeFirstResponder
+{
+    // Accept first responder but keep window key
+    [[self window] makeKeyWindow];
+    return YES;
+}
+
 - (void)mouseDown:(NSEvent *)event
 {
-    // Ensure container window is raised and Kate has focus
+    // Ensure container window is raised but don't give Kate real focus
     if (display && containerWindow && !isMinimized && embedded) {
         suppressErrors = YES;
         
@@ -928,15 +938,164 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
             // Check if Kate window is still valid
             XWindowAttributes attrs;
             if (XGetWindowAttributes(display, kateWindow, &attrs)) {
-                // Only set focus if window is mapped
+                // Only send events if window is mapped
                 if (attrs.map_state == IsViewable) {
-                    XSetInputFocus(display, kateWindow, RevertToParent, CurrentTime);
+                    // Don't actually set focus to Kate - just send the click event
+                    // This allows Kate to receive input without stealing focus
+                    
+                    // Convert coordinates
+                    NSPoint loc = [event locationInWindow];
+                    NSRect bounds = [self bounds];
+                    
+                    // Generate a fake click event to Kate
+                    XButtonEvent buttonEvent;
+                    buttonEvent.type = ButtonPress;
+                    buttonEvent.display = display;
+                    buttonEvent.window = kateWindow;
+                    buttonEvent.root = DefaultRootWindow(display);
+                    buttonEvent.subwindow = None;
+                    buttonEvent.time = CurrentTime;
+                    buttonEvent.x = loc.x;
+                    buttonEvent.y = bounds.size.height - loc.y; // Invert Y
+                    buttonEvent.x_root = buttonEvent.x;
+                    buttonEvent.y_root = buttonEvent.y;
+                    buttonEvent.state = 0;
+                    buttonEvent.button = Button1;
+                    buttonEvent.same_screen = True;
+                    
+                    XSendEvent(display, kateWindow, False, ButtonPressMask, (XEvent *)&buttonEvent);
+                    
+                    buttonEvent.type = ButtonRelease;
+                    XSendEvent(display, kateWindow, False, ButtonReleaseMask, (XEvent *)&buttonEvent);
                 }
             }
         }
         
         XFlush(display);
         suppressErrors = NO;
+    }
+    
+    // Keep ourselves as first responder
+    [[self window] makeFirstResponder:self];
+    [[self window] makeKeyWindow];
+}
+
+- (void)mouseUp:(NSEvent *)event
+{
+    // Forward mouse up events too
+    if (display && kateWindow && embedded) {
+        NSPoint loc = [event locationInWindow];
+        NSRect bounds = [self bounds];
+        
+        XButtonEvent buttonEvent;
+        buttonEvent.type = ButtonRelease;
+        buttonEvent.display = display;
+        buttonEvent.window = kateWindow;
+        buttonEvent.root = DefaultRootWindow(display);
+        buttonEvent.subwindow = None;
+        buttonEvent.time = CurrentTime;
+        buttonEvent.x = loc.x;
+        buttonEvent.y = bounds.size.height - loc.y;
+        buttonEvent.x_root = buttonEvent.x;
+        buttonEvent.y_root = buttonEvent.y;
+        buttonEvent.state = 0;
+        buttonEvent.button = Button1;
+        buttonEvent.same_screen = True;
+        
+        XSendEvent(display, kateWindow, False, ButtonReleaseMask, (XEvent *)&buttonEvent);
+        XFlush(display);
+    }
+}
+
+- (void)mouseDragged:(NSEvent *)event
+{
+    // Forward drag events for text selection
+    if (display && kateWindow && embedded) {
+        NSPoint loc = [event locationInWindow];
+        NSRect bounds = [self bounds];
+        
+        XMotionEvent motionEvent;
+        motionEvent.type = MotionNotify;
+        motionEvent.display = display;
+        motionEvent.window = kateWindow;
+        motionEvent.root = DefaultRootWindow(display);
+        motionEvent.subwindow = None;
+        motionEvent.time = CurrentTime;
+        motionEvent.x = loc.x;
+        motionEvent.y = bounds.size.height - loc.y;
+        motionEvent.x_root = motionEvent.x;
+        motionEvent.y_root = motionEvent.y;
+        motionEvent.state = Button1Mask; // Button 1 is pressed during drag
+        motionEvent.is_hint = NotifyNormal;
+        motionEvent.same_screen = True;
+        
+        XSendEvent(display, kateWindow, False, PointerMotionMask | Button1MotionMask, (XEvent *)&motionEvent);
+        XFlush(display);
+    }
+}
+
+- (void)keyDown:(NSEvent *)event
+{
+    // Forward key events to Kate while keeping GNUstep window active
+    if (display && kateWindow && embedded) {
+        NSString *characters = [event characters];
+        if ([characters length] > 0) {
+            // Convert NSEvent to X11 key event
+            XKeyEvent keyEvent;
+            keyEvent.display = display;
+            keyEvent.window = kateWindow;
+            keyEvent.root = DefaultRootWindow(display);
+            keyEvent.subwindow = None;
+            keyEvent.time = CurrentTime;
+            keyEvent.x = 1;
+            keyEvent.y = 1;
+            keyEvent.x_root = 1;
+            keyEvent.y_root = 1;
+            keyEvent.same_screen = True;
+            
+            // Set modifiers
+            keyEvent.state = 0;
+            if ([event modifierFlags] & NSShiftKeyMask) keyEvent.state |= ShiftMask;
+            if ([event modifierFlags] & NSControlKeyMask) keyEvent.state |= ControlMask;
+            if ([event modifierFlags] & NSAlternateKeyMask) keyEvent.state |= Mod1Mask;
+            if ([event modifierFlags] & NSCommandKeyMask) keyEvent.state |= Mod4Mask;
+            
+            // Get the keycode
+            unichar ch = [characters characterAtIndex:0];
+            KeySym keysym = XK_VoidSymbol;
+            
+            // Map common keys
+            if (ch >= 0x20 && ch <= 0x7E) {
+                keysym = ch;
+            } else {
+                switch(ch) {
+                    case NSUpArrowFunctionKey: keysym = XK_Up; break;
+                    case NSDownArrowFunctionKey: keysym = XK_Down; break;
+                    case NSLeftArrowFunctionKey: keysym = XK_Left; break;
+                    case NSRightArrowFunctionKey: keysym = XK_Right; break;
+                    case NSDeleteCharacter: keysym = XK_BackSpace; break;
+                    case NSDeleteFunctionKey: keysym = XK_Delete; break;
+                    case NSHomeFunctionKey: keysym = XK_Home; break;
+                    case NSEndFunctionKey: keysym = XK_End; break;
+                    case NSPageUpFunctionKey: keysym = XK_Page_Up; break;
+                    case NSPageDownFunctionKey: keysym = XK_Page_Down; break;
+                    case '\r': keysym = XK_Return; break;
+                    case '\t': keysym = XK_Tab; break;
+                    case 27: keysym = XK_Escape; break;
+                    default: keysym = ch; break;
+                }
+            }
+            
+            keyEvent.keycode = XKeysymToKeycode(display, keysym);
+            keyEvent.type = KeyPress;
+            
+            XSendEvent(display, kateWindow, True, KeyPressMask, (XEvent *)&keyEvent);
+            
+            keyEvent.type = KeyRelease;
+            XSendEvent(display, kateWindow, True, KeyReleaseMask, (XEvent *)&keyEvent);
+            
+            XFlush(display);
+        }
     }
 }
 
@@ -949,12 +1108,19 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     NSTimer *positionUpdateTimer;
     NSTimer *x11EventTimer;
 }
+- (void)setupMenus;
+- (void)newDocument:(id)sender;
+- (void)copySelection:(id)sender;
+- (void)pasteClipboard:(id)sender;
 @end
 
 @implementation KateWrapperController
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification
 {
+    // Set up the application menus
+    [self setupMenus];
+    
     // Create main window
     NSRect frame = NSMakeRect(100, 100, 900, 700);
     mainWindow = [[NSWindow alloc] initWithContentRect:frame
@@ -993,6 +1159,164 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     [self setupX11EventProcessing];
 }
 
+- (void)setupMenus
+{
+    NSMenu *mainMenu = [[NSMenu alloc] init];
+    id menuItem;  // Use id to avoid casting warnings
+    NSMenu *submenu;
+    
+    // Application menu - using app name "KateWrapper"
+    menuItem = [mainMenu addItemWithTitle:@"KateWrapper" action:NULL keyEquivalent:@""];
+    submenu = [[NSMenu alloc] initWithTitle:@"KateWrapper"];
+    [mainMenu setSubmenu:submenu forItem:menuItem];
+    
+    // About
+    [submenu addItemWithTitle:@"About KateWrapper"
+                       action:@selector(orderFrontStandardAboutPanel:)
+                keyEquivalent:@""];
+    
+    // Separator
+    [submenu addItem:[NSMenuItem separatorItem]];
+    
+    // New document
+    [submenu addItemWithTitle:@"New"
+                       action:@selector(newDocument:)
+                keyEquivalent:@"n"];
+    
+    // Separator
+    [submenu addItem:[NSMenuItem separatorItem]];
+    
+    // Hide KateWrapper
+    menuItem = [submenu addItemWithTitle:@"Hide KateWrapper"
+                                   action:@selector(hide:)
+                            keyEquivalent:@"h"];
+    [menuItem setTarget:NSApp];
+    
+    // Hide Others
+    menuItem = [submenu addItemWithTitle:@"Hide Others"
+                                   action:@selector(hideOtherApplications:)
+                            keyEquivalent:@"h"];
+    [menuItem setKeyEquivalentModifierMask:(NSCommandKeyMask | NSAlternateKeyMask)];
+    [menuItem setTarget:NSApp];
+    
+    // Show All
+    menuItem = [submenu addItemWithTitle:@"Show All"
+                                   action:@selector(unhideAllApplications:)
+                            keyEquivalent:@""];
+    [menuItem setTarget:NSApp];
+    
+    // Separator
+    [submenu addItem:[NSMenuItem separatorItem]];
+    
+    // Quit
+    [submenu addItemWithTitle:@"Quit KateWrapper"
+                       action:@selector(terminate:)
+                keyEquivalent:@"q"];
+    
+    [submenu release];
+    
+    // Edit menu
+    menuItem = [mainMenu addItemWithTitle:@"Edit" action:NULL keyEquivalent:@""];
+    submenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+    [mainMenu setSubmenu:submenu forItem:menuItem];
+    
+    // Undo
+    menuItem = [submenu addItemWithTitle:@"Undo"
+                                   action:@selector(undo:)
+                            keyEquivalent:@"z"];
+    
+    // Redo
+    menuItem = [submenu addItemWithTitle:@"Redo"
+                                   action:@selector(redo:)
+                            keyEquivalent:@"Z"];
+    
+    // Separator
+    [submenu addItem:[NSMenuItem separatorItem]];
+    
+    // Cut
+    menuItem = [submenu addItemWithTitle:@"Cut"
+                                   action:@selector(cut:)
+                            keyEquivalent:@"x"];
+    
+    // Copy
+    [submenu addItemWithTitle:@"Copy"
+                       action:@selector(copySelection:)
+                keyEquivalent:@"c"];
+    
+    // Paste
+    [submenu addItemWithTitle:@"Paste"
+                       action:@selector(pasteClipboard:)
+                keyEquivalent:@"v"];
+    
+    // Select All
+    menuItem = [submenu addItemWithTitle:@"Select All"
+                                   action:@selector(selectAll:)
+                            keyEquivalent:@"a"];
+    
+    [submenu release];
+    
+    // Windows menu
+    menuItem = [mainMenu addItemWithTitle:@"Windows" action:NULL keyEquivalent:@""];
+    submenu = [[NSMenu alloc] initWithTitle:@"Windows"];
+    [mainMenu setSubmenu:submenu forItem:menuItem];
+    [NSApp setWindowsMenu:submenu];
+    
+    // Minimize
+    menuItem = [submenu addItemWithTitle:@"Minimize"
+                                   action:@selector(performMiniaturize:)
+                            keyEquivalent:@"m"];
+    
+    // Zoom
+    menuItem = [submenu addItemWithTitle:@"Zoom"
+                                   action:@selector(performZoom:)
+                            keyEquivalent:@""];
+    
+    // Separator
+    [submenu addItem:[NSMenuItem separatorItem]];
+    
+    // Bring All to Front
+    menuItem = [submenu addItemWithTitle:@"Bring All to Front"
+                                   action:@selector(arrangeInFront:)
+                            keyEquivalent:@""];
+    
+    [submenu release];
+    
+    // Help menu (optional but standard)
+    menuItem = [mainMenu addItemWithTitle:@"Help" action:NULL keyEquivalent:@""];
+    submenu = [[NSMenu alloc] initWithTitle:@"Help"];
+    [mainMenu setSubmenu:submenu forItem:menuItem];
+    
+    menuItem = [submenu addItemWithTitle:@"Kate Help"
+                                   action:@selector(showHelp:)
+                            keyEquivalent:@"?"];
+    
+    [submenu release];
+    
+    // Set the main menu
+    [NSApp setMainMenu:mainMenu];
+    [mainMenu release];
+}
+
+- (void)newDocument:(id)sender
+{
+    // You could send a keyboard shortcut to Kate here
+    // For now, just log the action
+    NSLog(@"New document requested");
+    // TODO: Send Ctrl+N to Kate window
+}
+
+- (void)copySelection:(id)sender
+{
+    NSLog(@"Copy requested");
+    // TODO: Send Ctrl+C to Kate window
+}
+
+- (void)pasteClipboard:(id)sender
+{
+    NSLog(@"Paste requested");
+    // TODO: Send Ctrl+V to Kate window
+}
+
 - (void)setupX11EventProcessing
 {
     x11EventTimer = [NSTimer scheduledTimerWithTimeInterval:0.01
@@ -1012,6 +1336,12 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     while (XPending(display)) {
         XEvent event;
         XNextEvent(display, &event);
+        
+        // Intercept and block focus events from Kate
+        if (event.type == FocusIn || event.type == FocusOut) {
+            // Don't let Kate focus events propagate
+            continue;
+        }
         
         // Check for DestroyNotify events on Kate window
         if (event.type == DestroyNotify) {
@@ -1043,6 +1373,11 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
             }
             suppressErrors = NO;
         }
+    }
+    
+    // Always ensure our window stays key
+    if ([mainWindow isVisible] && ![mainWindow isKeyWindow]) {
+        [mainWindow makeKeyWindow];
     }
 }
 
