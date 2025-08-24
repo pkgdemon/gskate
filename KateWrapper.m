@@ -33,16 +33,18 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     pid_t katePid;
     BOOL embedded;
     NSTimer *windowSearchTimer;
-    NSTimer *processMonitorTimer;  // Add timer to monitor Kate process
+    NSTimer *processMonitorTimer;
     int searchAttempts;
     NSPoint lastPosition;
     NSSize lastSize;
     BOOL isMinimized;
+    BOOL isClosing;  // Add flag to prevent multiple close attempts
 }
 - (id)initWithFrame:(NSRect)frame;
 - (void)embedWindow:(Window)window;
 - (void)launchKate;
 - (Display*)x11Display;
+- (Window)kateWindow;  // Add getter for Kate window
 - (void)searchForKateWindow:(NSTimer*)timer;
 - (void)setupContainerWindow;
 - (void)updateContainerPosition;
@@ -58,8 +60,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 - (void)windowDidExpose:(NSNotification *)notification;
 - (void)handleWindowRestore;
 - (void)restoreKateWindowDelayed:(NSTimer *)timer;
-- (void)checkKateProcess:(NSTimer*)timer;  // Add method to check Kate process
-- (void)terminateKate;  // Add method to properly terminate Kate
+- (void)checkKateProcess:(NSTimer*)timer;
+- (void)terminateKate;
+- (void)handleKateWindowDestroyed;  // Add method to handle Kate window destruction
 @end
 
 @implementation XEmbedView
@@ -71,8 +74,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         embedded = NO;
         searchAttempts = 0;
         kateWindow = 0;
-        katePid = 0;  // Initialize to 0
+        katePid = 0;
         isMinimized = NO;
+        isClosing = NO;  // Initialize closing flag
         lastPosition = NSMakePoint(-1, -1);
         lastSize = NSMakeSize(0, 0);
         
@@ -96,6 +100,11 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         [self setupContainerWindow];
     }
     return self;
+}
+
+- (Window)kateWindow
+{
+    return kateWindow;
 }
 
 - (void)viewDidMoveToWindow
@@ -163,8 +172,42 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 
 - (void)windowWillClose:(NSNotification *)notification
 {
-    NSLog(@"Window will close - terminating our Kate instance (PID %d)", katePid);
-    [self terminateKate];
+    if (!isClosing) {
+        isClosing = YES;
+        NSLog(@"Window will close - terminating our Kate instance (PID %d)", katePid);
+        [self terminateKate];
+    }
+}
+
+- (void)handleKateWindowDestroyed
+{
+    if (!isClosing) {
+        isClosing = YES;
+        NSLog(@"Kate window was destroyed - closing wrapper");
+        
+        // Stop monitoring timers
+        if (processMonitorTimer) {
+            [processMonitorTimer invalidate];
+            [processMonitorTimer release];
+            processMonitorTimer = nil;
+        }
+        
+        if (windowSearchTimer) {
+            [windowSearchTimer invalidate];
+            [windowSearchTimer release];
+            windowSearchTimer = nil;
+        }
+        
+        // Mark as not embedded
+        embedded = NO;
+        kateWindow = 0;
+        katePid = 0;
+        
+        // Close the wrapper window on the main thread
+        [[self window] performSelectorOnMainThread:@selector(performClose:)
+                                         withObject:nil
+                                      waitUntilDone:NO];
+    }
 }
 
 - (void)terminateKate
@@ -564,9 +607,6 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     if (katePid == 0) {
         // Child process
         
-        // Don't create a new process group - this would affect child windows
-        // setpgid(0, 0);  // REMOVED
-        
         // Set environment to encourage embedding
         char windowId[32];
         snprintf(windowId, sizeof(windowId), "%lu", containerWindow);
@@ -579,17 +619,22 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         setenv("GTK_CSD", "0", 1);
         setenv("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1", 1);
         
+        // Important: Tell Kate to use a specific session to avoid restoring windows
+        setenv("KATE_SESSION", "gnustep-wrapper", 1);
+        
         // Reset signal handlers to default
         signal(SIGTERM, SIG_DFL);
         signal(SIGINT, SIG_DFL);
         signal(SIGHUP, SIG_DFL);
         
         // Launch Kate with better arguments for embedding
+        // Remove -n flag as it might cause Kate to create additional windows
         char *args[] = {
             "kate",
-            "-n",  // Start a new kate instance (short for --new)
+            "-s", "gnustep-wrapper",  // Use a specific session name
             "-b",  // Block - don't detach from terminal (important for process tracking)
-            NULL   // Removed --desktopfile as it might interfere
+            "--tempfile",  // Start with a temp file instead of restoring session
+            NULL
         };
         
         execvp("kate", args);
@@ -600,9 +645,6 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         NSLog(@"Failed to fork process");
     } else {
         NSLog(@"Launched Kate with PID: %d", katePid);
-        
-        // Don't set process group from parent either
-        // setpgid(katePid, katePid);  // REMOVED
         
         // Start searching for Kate's window after a delay
         windowSearchTimer = [[NSTimer scheduledTimerWithTimeInterval:0.1
@@ -643,22 +685,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         kateWindow = 0;
         
         // Close the wrapper window
-        [[self window] performClose:nil];
-    } else {
-        // Also check if Kate window still exists
-        if (kateWindow && embedded) {
-            XWindowAttributes attrs;
-            suppressErrors = YES;
-            if (!XGetWindowAttributes(display, kateWindow, &attrs)) {
-                // Window no longer exists
-                NSLog(@"Kate window destroyed but process still running");
-                embedded = NO;
-                kateWindow = 0;
-                
-                // Try to find it again
-                [self findAndEmbedKateWindow];
-            }
-            suppressErrors = NO;
+        if (!isClosing) {
+            isClosing = YES;
+            [[self window] performClose:nil];
         }
     }
 }
@@ -695,7 +724,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
                 continue;
             }
             
-            // Check window PID
+            // Check window PID first
             Atom type;
             int format;
             unsigned long nitems, bytes_after;
@@ -708,50 +737,39 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
                 XFree(prop);
                 
                 if (windowPid == katePid) {
-                    // Check if it's a real window
+                    // Check if it's a real window (not a menu or tooltip)
                     XWindowAttributes attrs;
                     if (XGetWindowAttributes(display, children[i], &attrs) &&
                         attrs.map_state != IsUnmapped &&
-                        attrs.width > 100 && attrs.height > 100) {
+                        attrs.width > 100 && attrs.height > 100 &&
+                        attrs.class == InputOutput) {  // Ensure it's an InputOutput window
                         
-                        NSLog(@"Found Kate window %lu with PID %d", children[i], katePid);
-                        [self embedWindow:children[i]];
-                        break;
-                    }
-                }
-            }
-            
-            // Also check by WM_CLASS as fallback
-            if (!embedded) {
-                XClassHint classHint;
-                if (XGetClassHint(display, children[i], &classHint)) {
-                    if (classHint.res_class && 
-                        strcasecmp(classHint.res_class, "kate") == 0) {
+                        // Additional check: make sure it's a main window, not a dialog
+                        Atom wmWindowType = XInternAtom(display, "_NET_WM_WINDOW_TYPE", False);
+                        Atom wmNormalType = XInternAtom(display, "_NET_WM_WINDOW_TYPE_NORMAL", False);
+                        Atom actualType;
+                        int actualFormat;
+                        unsigned long nItems, bytesAfter;
+                        unsigned char *windowType = NULL;
                         
-                        // Check if it's a top-level window
-                        Window root_return, parent_return;
-                        Window *children_return;
-                        unsigned int nchildren_return;
-                        
-                        if (XQueryTree(display, children[i], &root_return, 
-                                      &parent_return, &children_return, &nchildren_return)) {
-                            if (children_return) XFree(children_return);
-                            
-                            if (parent_return == root || parent_return == DefaultRootWindow(display)) {
-                                // Check window attributes
-                                XWindowAttributes attrs;
-                                if (XGetWindowAttributes(display, children[i], &attrs) &&
-                                    attrs.width > 100 && attrs.height > 100) {
-                                    NSLog(@"Found Kate window by class: %lu", children[i]);
-                                    [self embedWindow:children[i]];
-                                }
+                        BOOL isMainWindow = YES;
+                        if (XGetWindowProperty(display, children[i], wmWindowType, 0, 1, False,
+                                             XA_ATOM, &actualType, &actualFormat, &nItems,
+                                             &bytesAfter, &windowType) == Success && windowType) {
+                            Atom *typeAtom = (Atom*)windowType;
+                            // Only embed normal windows, not dialogs or special windows
+                            if (*typeAtom != wmNormalType && *typeAtom != 0) {
+                                isMainWindow = NO;
                             }
+                            XFree(windowType);
+                        }
+                        
+                        if (isMainWindow) {
+                            NSLog(@"Found Kate main window %lu with PID %d", children[i], katePid);
+                            [self embedWindow:children[i]];
+                            break;
                         }
                     }
-                    if (classHint.res_name) XFree(classHint.res_name);
-                    if (classHint.res_class) XFree(classHint.res_class);
-                    
-                    if (embedded) break;
                 }
             }
         }
@@ -775,7 +793,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     
     // Select events on Kate window - add DestroyNotify to detect when Kate closes
     XSelectInput(display, kateWindow,
-                StructureNotifyMask | PropertyChangeMask | FocusChangeMask);
+                StructureNotifyMask | PropertyChangeMask | FocusChangeMask | SubstructureNotifyMask);
     
     // Unmap the window first
     XUnmapWindow(display, kateWindow);
@@ -865,6 +883,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     NSWindow *mainWindow;
     XEmbedView *embedView;
     NSTimer *positionUpdateTimer;
+    NSTimer *x11EventTimer;
 }
 @end
 
@@ -909,23 +928,25 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
                                                           userInfo:nil
                                                            repeats:YES];
     
-    // Set up X11 event processing
+    // Set up X11 event processing with higher frequency for better responsiveness
     [self setupX11EventProcessing];
 }
 
 - (void)setupX11EventProcessing
 {
-    [NSTimer scheduledTimerWithTimeInterval:0.01
-                                      target:self
-                                    selector:@selector(processX11Events:)
-                                    userInfo:nil
-                                     repeats:YES];
+    x11EventTimer = [NSTimer scheduledTimerWithTimeInterval:0.01
+                                                      target:self
+                                                    selector:@selector(processX11Events:)
+                                                    userInfo:nil
+                                                     repeats:YES];
 }
 
 - (void)processX11Events:(NSTimer*)timer
 {
     Display *display = [embedView x11Display];
     if (!display) return;
+    
+    Window kateWin = [embedView kateWindow];
     
     while (XPending(display)) {
         XEvent event;
@@ -934,7 +955,32 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         // Check for DestroyNotify events on Kate window
         if (event.type == DestroyNotify) {
             NSLog(@"Received DestroyNotify event for window %lu", event.xdestroywindow.window);
-            // The process monitor will handle closing the wrapper
+            
+            // Check if this is our Kate window
+            if (kateWin && event.xdestroywindow.window == kateWin) {
+                NSLog(@"Kate window destroyed - closing wrapper");
+                [embedView handleKateWindowDestroyed];
+                break;  // Exit the event loop since we're closing
+            }
+        }
+        // Also check for UnmapNotify which might indicate Kate is closing
+        else if (event.type == UnmapNotify && kateWin && event.xunmap.window == kateWin) {
+            NSLog(@"Kate window unmapped - checking if it's closing");
+            
+            // Give Kate a moment to destroy the window if it's closing
+            usleep(100000);  // 100ms
+            
+            // Check if the window still exists
+            XWindowAttributes attrs;
+            suppressErrors = YES;
+            if (!XGetWindowAttributes(display, kateWin, &attrs)) {
+                // Window no longer exists
+                NSLog(@"Kate window no longer exists after unmap - closing wrapper");
+                [embedView handleKateWindowDestroyed];
+                suppressErrors = NO;
+                break;
+            }
+            suppressErrors = NO;
         }
     }
 }
@@ -943,6 +989,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 {
     if (positionUpdateTimer) {
         [positionUpdateTimer invalidate];
+    }
+    if (x11EventTimer) {
+        [x11EventTimer invalidate];
     }
     [embedView release];
     [mainWindow release];
