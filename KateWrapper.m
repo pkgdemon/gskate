@@ -36,6 +36,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     int searchAttempts;
     NSPoint lastPosition;
     NSSize lastSize;
+    BOOL isMinimized;
 }
 - (id)initWithFrame:(NSRect)frame;
 - (void)embedWindow:(Window)window;
@@ -48,6 +49,14 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 - (void)windowIsMoving:(NSNotification *)notification;
 - (void)windowIsResizing:(NSNotification *)notification;
 - (void)windowDidResize:(NSNotification *)notification;
+- (void)windowWillMiniaturize:(NSNotification *)notification;
+- (void)windowDidMiniaturize:(NSNotification *)notification;
+- (void)windowDidDeminiaturize:(NSNotification *)notification;
+- (void)windowDidBecomeKey:(NSNotification *)notification;
+- (void)windowDidBecomeMain:(NSNotification *)notification;
+- (void)windowDidExpose:(NSNotification *)notification;
+- (void)handleWindowRestore;
+- (void)restoreKateWindowDelayed:(NSTimer *)timer;
 @end
 
 @implementation XEmbedView
@@ -59,6 +68,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         embedded = NO;
         searchAttempts = 0;
         kateWindow = 0;
+        isMinimized = NO;
         lastPosition = NSMakePoint(-1, -1);
         lastSize = NSMakeSize(0, 0);
         
@@ -105,24 +115,202 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
                                                  selector:@selector(windowIsResizing:)
                                                      name:NSWindowDidUpdateNotification
                                                    object:[self window]];
+        
+        // Listen for miniaturization events
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(windowWillMiniaturize:)
+                                                     name:NSWindowWillMiniaturizeNotification
+                                                   object:[self window]];
+        
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(windowDidMiniaturize:)
+                                                     name:NSWindowDidMiniaturizeNotification
+                                                   object:[self window]];
+        
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(windowDidDeminiaturize:)
+                                                     name:NSWindowDidDeminiaturizeNotification
+                                                   object:[self window]];
+        
+        // Also listen for window becoming key/main (might fire on restore)
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(windowDidBecomeKey:)
+                                                     name:NSWindowDidBecomeKeyNotification
+                                                   object:[self window]];
+        
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(windowDidBecomeMain:)
+                                                     name:NSWindowDidBecomeMainNotification
+                                                   object:[self window]];
+        
+        // Listen for window order changes
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(windowDidExpose:)
+                                                     name:NSWindowDidExposeNotification
+                                                   object:[self window]];
+    }
+}
+
+- (void)windowDidBecomeKey:(NSNotification *)notification
+{
+    NSLog(@"Window became key - checking if we need to restore");
+    if (isMinimized) {
+        NSLog(@"Window was minimized, triggering restore");
+        [self handleWindowRestore];
+    }
+}
+
+- (void)windowDidBecomeMain:(NSNotification *)notification
+{
+    NSLog(@"Window became main - checking if we need to restore");
+    if (isMinimized) {
+        NSLog(@"Window was minimized, triggering restore");
+        [self handleWindowRestore];
+    }
+}
+
+- (void)windowDidExpose:(NSNotification *)notification
+{
+    NSLog(@"Window exposed - checking if we need to restore");
+    if (isMinimized) {
+        NSLog(@"Window was minimized, triggering restore");
+        [self handleWindowRestore];
     }
 }
 
 - (void)windowIsMoving:(NSNotification *)notification
 {
     // Update position immediately during movement
-    [self updateContainerPosition];
+    if (!isMinimized) {
+        [self updateContainerPosition];
+    }
 }
 
 - (void)windowIsResizing:(NSNotification *)notification
 {
     // Update during live resize
-    [self updateContainerPosition];
+    if (!isMinimized) {
+        [self updateContainerPosition];
+    }
 }
 
 - (void)windowDidResize:(NSNotification *)notification
 {
-    [self updateContainerPosition];
+    if (!isMinimized) {
+        [self updateContainerPosition];
+    }
+}
+
+- (void)windowWillMiniaturize:(NSNotification *)notification
+{
+    isMinimized = YES;
+    
+    if (containerWindow) {
+        // Just unmap the container - Kate should stay as a child
+        XUnmapWindow(display, containerWindow);
+        XSync(display, False);
+        
+        NSLog(@"Container window unmapped for minimize");
+    }
+}
+
+- (void)windowDidMiniaturize:(NSNotification *)notification
+{
+    isMinimized = YES;
+}
+
+- (void)windowDidDeminiaturize:(NSNotification *)notification
+{
+    NSLog(@"windowDidDeminiaturize called");
+    [self handleWindowRestore];
+}
+
+- (void)handleWindowRestore
+{
+    if (!isMinimized) {
+        return;  // Already restored
+    }
+    
+    NSLog(@"Starting window restoration");
+    
+    // Use a timer for the delay
+    [NSTimer scheduledTimerWithTimeInterval:0.3
+                                      target:self
+                                    selector:@selector(restoreKateWindowDelayed:)
+                                    userInfo:nil
+                                     repeats:NO];
+}
+
+- (void)restoreKateWindowDelayed:(NSTimer *)timer
+{
+    NSLog(@"Restoring Kate window after delay");
+    
+    isMinimized = NO;
+    
+    if (containerWindow) {
+        // Check if Kate is still our child
+        if (kateWindow && embedded) {
+            Window root_return, parent_return;
+            Window *children_return;
+            unsigned int nchildren_return;
+            
+            if (XQueryTree(display, kateWindow, &root_return, 
+                          &parent_return, &children_return, &nchildren_return)) {
+                if (children_return) XFree(children_return);
+                
+                NSLog(@"Kate parent is %lu, our container is %lu", parent_return, containerWindow);
+                
+                // If Kate is no longer our child, we need to find it again
+                if (parent_return != containerWindow) {
+                    NSLog(@"Kate detached! Need to re-embed");
+                    embedded = NO;
+                    [self findAndEmbedKateWindow];
+                }
+            }
+        }
+        
+        // Update position first
+        [self updateContainerPosition];
+        
+        // Map the container
+        XMapWindow(display, containerWindow);
+        XRaiseWindow(display, containerWindow);
+        
+        if (kateWindow && embedded) {
+            // Make sure Kate is mapped
+            XMapWindow(display, kateWindow);
+            XRaiseWindow(display, kateWindow);
+            
+            // Force Kate to redraw
+            NSRect bounds = [self bounds];
+            
+            // Clear the window to force expose events
+            XClearArea(display, kateWindow, 0, 0, 
+                      bounds.size.width, bounds.size.height, True);
+            
+            // Also send an expose event directly
+            XEvent exposeEvent;
+            memset(&exposeEvent, 0, sizeof(exposeEvent));
+            exposeEvent.type = Expose;
+            exposeEvent.xexpose.window = kateWindow;
+            exposeEvent.xexpose.x = 0;
+            exposeEvent.xexpose.y = 0;
+            exposeEvent.xexpose.width = bounds.size.width;
+            exposeEvent.xexpose.height = bounds.size.height;
+            exposeEvent.xexpose.count = 0;
+            
+            XSendEvent(display, kateWindow, False, ExposureMask, &exposeEvent);
+            
+            // Set focus
+            XSetInputFocus(display, kateWindow, RevertToParent, CurrentTime);
+            
+            XSync(display, False);
+            
+            NSLog(@"Kate window should be restored");
+        } else {
+            NSLog(@"Kate window not embedded, cannot restore");
+        }
+    }
 }
 
 - (void)setupContainerWindow
@@ -188,7 +376,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 
 - (void)updateContainerPosition
 {
-    if (!containerWindow) return;
+    if (!containerWindow || isMinimized) return;
     
     // Get screen position of this view
     NSWindow *window = [self window];
@@ -246,7 +434,15 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     [[NSColor darkGrayColor] set];
     NSRectFill(rect);
     
-    [self updateContainerPosition];
+    if (!isMinimized) {
+        [self updateContainerPosition];
+    } else {
+        // Check if window is actually visible (might indicate restore)
+        if ([[self window] isVisible] && [[self window] isMiniaturized] == NO) {
+            NSLog(@"Window is visible but we think it's minimized - restoring");
+            [self handleWindowRestore];
+        }
+    }
     
     [super drawRect:rect];
 }
@@ -485,7 +681,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 - (void)setFrame:(NSRect)frame
 {
     [super setFrame:frame];
-    [self updateContainerPosition];
+    if (!isMinimized) {
+        [self updateContainerPosition];
+    }
 }
 
 - (BOOL)acceptsFirstResponder
@@ -496,12 +694,24 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 - (void)mouseDown:(NSEvent *)event
 {
     // Ensure container window is raised and Kate has focus
-    if (display && containerWindow) {
+    if (display && containerWindow && !isMinimized) {
+        suppressErrors = YES;  // Suppress errors during focus operations
+        
         XRaiseWindow(display, containerWindow);
-        if (kateWindow) {
-            XSetInputFocus(display, kateWindow, RevertToParent, CurrentTime);
+        
+        if (kateWindow && embedded) {
+            // Check if Kate window is still valid
+            XWindowAttributes attrs;
+            if (XGetWindowAttributes(display, kateWindow, &attrs)) {
+                // Only set focus if window is mapped
+                if (attrs.map_state == IsViewable) {
+                    XSetInputFocus(display, kateWindow, RevertToParent, CurrentTime);
+                }
+            }
         }
+        
         XFlush(display);
+        suppressErrors = NO;
     }
 }
 
