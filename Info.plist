@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//GNUstep//DTD plist 0.9//EN" "http://www.gnustep.org/plist-0_9.dtd">
+<plist version="0.9">
+<dict>
+    <key>ApplicationName</key>
+    <string>KateWrapper</string>
+    <key>ApplicationDescription</key>
+    <string>GNUstep wrapper for Kate editor using XEmbed</string>
+    <key>ApplicationIcon</key>
+    <string>kate</string>
+    <key>ApplicationRelease</key>
+    <string>1.0</string>
+    <key>Authors</key>
+    <array>
+        <string>GNUstep Kate Wrapper</string>
+    </array>
+    <key>Copyright</key>
+    <string>Copyright (C) 2025</string>
+    <key>CopyrightDescription</key>
+    <string>Released under GPL</string>
+    <key>FullVersionID</key>
+    <string>1.0.0</string>
+    <key>NSExecutable</key>
+    <string>KateWrapper</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>
