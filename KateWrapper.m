@@ -38,13 +38,14 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     NSPoint lastPosition;
     NSSize lastSize;
     BOOL isMinimized;
-    BOOL isClosing;  // Add flag to prevent multiple close attempts
+    BOOL isClosing;
+    BOOL containerVisible;  // Track container visibility
 }
 - (id)initWithFrame:(NSRect)frame;
 - (void)embedWindow:(Window)window;
 - (void)launchKate;
 - (Display*)x11Display;
-- (Window)kateWindow;  // Add getter for Kate window
+- (Window)kateWindow;
 - (void)searchForKateWindow:(NSTimer*)timer;
 - (void)setupContainerWindow;
 - (void)updateContainerPosition;
@@ -62,7 +63,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 - (void)restoreKateWindowDelayed:(NSTimer *)timer;
 - (void)checkKateProcess:(NSTimer*)timer;
 - (void)terminateKate;
-- (void)handleKateWindowDestroyed;  // Add method to handle Kate window destruction
+- (void)handleKateWindowDestroyed;
+- (void)showContainer;  // New method
+- (void)hideContainer;  // New method
 @end
 
 @implementation XEmbedView
@@ -76,7 +79,8 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         kateWindow = 0;
         katePid = 0;
         isMinimized = NO;
-        isClosing = NO;  // Initialize closing flag
+        isClosing = NO;
+        containerVisible = NO;  // Start with container hidden
         lastPosition = NSMakePoint(-1, -1);
         lastSize = NSMakeSize(0, 0);
         
@@ -105,6 +109,27 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 - (Window)kateWindow
 {
     return kateWindow;
+}
+
+- (void)showContainer
+{
+    if (!containerVisible && containerWindow) {
+        containerVisible = YES;
+        XMapWindow(display, containerWindow);
+        XRaiseWindow(display, containerWindow);
+        XFlush(display);
+        NSLog(@"Container window shown");
+    }
+}
+
+- (void)hideContainer
+{
+    if (containerVisible && containerWindow) {
+        containerVisible = NO;
+        XUnmapWindow(display, containerWindow);
+        XFlush(display);
+        NSLog(@"Container window hidden");
+    }
 }
 
 - (void)viewDidMoveToWindow
@@ -175,6 +200,10 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     if (!isClosing) {
         isClosing = YES;
         NSLog(@"Window will close - terminating our Kate instance (PID %d)", katePid);
+        
+        // Hide container immediately before terminating Kate
+        [self hideContainer];
+        
         [self terminateKate];
     }
 }
@@ -184,6 +213,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     if (!isClosing) {
         isClosing = YES;
         NSLog(@"Kate window was destroyed - closing wrapper");
+        
+        // Hide container immediately
+        [self hideContainer];
         
         // Stop monitoring timers
         if (processMonitorTimer) {
@@ -311,7 +343,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 - (void)windowIsMoving:(NSNotification *)notification
 {
     // Update position immediately during movement
-    if (!isMinimized) {
+    if (!isMinimized && embedded) {
         [self updateContainerPosition];
     }
 }
@@ -319,14 +351,14 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 - (void)windowIsResizing:(NSNotification *)notification
 {
     // Update during live resize
-    if (!isMinimized) {
+    if (!isMinimized && embedded) {
         [self updateContainerPosition];
     }
 }
 
 - (void)windowDidResize:(NSNotification *)notification
 {
-    if (!isMinimized) {
+    if (!isMinimized && embedded) {
         [self updateContainerPosition];
     }
 }
@@ -339,6 +371,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         // Just unmap the container - Kate should stay as a child
         XUnmapWindow(display, containerWindow);
         XSync(display, False);
+        containerVisible = NO;
         
         NSLog(@"Container window unmapped for minimize");
     }
@@ -377,9 +410,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     
     isMinimized = NO;
     
-    if (containerWindow) {
+    if (containerWindow && embedded) {
         // Check if Kate is still our child
-        if (kateWindow && embedded) {
+        if (kateWindow) {
             Window root_return, parent_return;
             Window *children_return;
             unsigned int nchildren_return;
@@ -402,9 +435,8 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         // Update position first
         [self updateContainerPosition];
         
-        // Map the container
-        XMapWindow(display, containerWindow);
-        XRaiseWindow(display, containerWindow);
+        // Show the container
+        [self showContainer];
         
         if (kateWindow && embedded) {
             // Make sure Kate is mapped
@@ -501,12 +533,13 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     XChangeProperty(display, containerWindow, wmState, XA_ATOM, 32,
                    PropModeReplace, (unsigned char*)states, 2);
     
-    NSLog(@"Created container window: %lu", containerWindow);
+    // IMPORTANT: Don't map the window here - wait until Kate is embedded
+    NSLog(@"Created container window: %lu (initially hidden)", containerWindow);
 }
 
 - (void)updateContainerPosition
 {
-    if (!containerWindow || isMinimized) return;
+    if (!containerWindow || isMinimized || !embedded) return;
     
     // Get screen position of this view
     NSWindow *window = [self window];
@@ -537,12 +570,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     // Move container window smoothly
     XConfigureWindow(display, containerWindow, mask, &changes);
     
-    // Keep it mapped and visible
-    if (!embedded || kateWindow == 0) {
-        XMapRaised(display, containerWindow);
-    }
-    
-    // Update Kate window size if embedded - but keep it mapped
+    // Update Kate window size if embedded
     if (kateWindow && embedded) {
         changes.x = 0;
         changes.y = 0;
@@ -561,10 +589,36 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 
 - (void)drawRect:(NSRect)rect
 {
-    [[NSColor darkGrayColor] set];
-    NSRectFill(rect);
+    // Draw a nice background while waiting for Kate
+    if (!embedded) {
+        // Draw a gradient or solid color instead of pure black
+        NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithCalibratedWhite:0.2 alpha:1.0]
+                                                              endingColor:[NSColor colorWithCalibratedWhite:0.3 alpha:1.0]];
+        [gradient drawInRect:rect angle:90.0];
+        [gradient release];
+        
+        // Draw a loading message
+        NSString *loadingText = @"Loading Kate...";
+        NSMutableParagraphStyle *style = [[[NSMutableParagraphStyle alloc] init] autorelease];
+        [style setAlignment:NSCenterTextAlignment];
+        
+        NSDictionary *attrs = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:14],
+            NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.7 alpha:1.0],
+            NSParagraphStyleAttributeName: style
+        };
+        
+        NSSize textSize = [loadingText sizeWithAttributes:attrs];
+        NSRect textRect = NSMakeRect(0, (rect.size.height - textSize.height) / 2, 
+                                     rect.size.width, textSize.height);
+        [loadingText drawInRect:textRect withAttributes:attrs];
+    } else {
+        // Once embedded, just clear the background
+        [[NSColor clearColor] set];
+        NSRectFill(rect);
+    }
     
-    if (!isMinimized) {
+    if (!isMinimized && embedded) {
         [self updateContainerPosition];
     } else {
         // Check if window is actually visible (might indicate restore)
@@ -581,7 +635,8 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     
-    [self terminateKate];  // Use the centralized termination method
+    [self hideContainer];  // Hide container before cleanup
+    [self terminateKate];
     
     if (display && containerWindow) {
         XDestroyWindow(display, containerWindow);
@@ -599,9 +654,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 
 - (void)launchKate
 {
-    // First ensure container is visible and positioned
+    // Don't show container yet - wait for Kate to be embedded
+    // Just update position so it's ready
     [self updateContainerPosition];
-    XFlush(display);
     
     katePid = fork();
     if (katePid == 0) {
@@ -628,11 +683,10 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         signal(SIGHUP, SIG_DFL);
         
         // Launch Kate with better arguments for embedding
-        // Remove -n flag as it might cause Kate to create additional windows
         char *args[] = {
             "kate",
             "-s", "gnustep-wrapper",  // Use a specific session name
-            "-b",  // Block - don't detach from terminal (important for process tracking)
+            "-b",  // Block - don't detach from terminal
             "--tempfile",  // Start with a temp file instead of restoring session
             NULL
         };
@@ -672,6 +726,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     if (kill(katePid, 0) != 0) {
         // Process no longer exists
         NSLog(@"Kate process (PID %d) has terminated", katePid);
+        
+        // Hide container immediately
+        [self hideContainer];
         
         // Stop monitoring
         [timer invalidate];
@@ -742,7 +799,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
                     if (XGetWindowAttributes(display, children[i], &attrs) &&
                         attrs.map_state != IsUnmapped &&
                         attrs.width > 100 && attrs.height > 100 &&
-                        attrs.class == InputOutput) {  // Ensure it's an InputOutput window
+                        attrs.class == InputOutput) {
                         
                         // Additional check: make sure it's a main window, not a dialog
                         Atom wmWindowType = XInternAtom(display, "_NET_WM_WINDOW_TYPE", False);
@@ -820,6 +877,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     // Map the Kate window
     XMapWindow(display, kateWindow);
     
+    // NOW show the container window since Kate is ready
+    [self showContainer];
+    
     // Raise both windows
     XRaiseWindow(display, containerWindow);
     XRaiseWindow(display, kateWindow);
@@ -836,13 +896,17 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     XChangeWindowAttributes(display, containerWindow, CWOverrideRedirect, &sattr);
     
     embedded = YES;
+    
+    // Force a redraw to clear the loading message
+    [self setNeedsDisplay:YES];
+    
     NSLog(@"Successfully embedded Kate window");
 }
 
 - (void)setFrame:(NSRect)frame
 {
     [super setFrame:frame];
-    if (!isMinimized) {
+    if (!isMinimized && embedded) {
         [self updateContainerPosition];
     }
 }
@@ -855,8 +919,8 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 - (void)mouseDown:(NSEvent *)event
 {
     // Ensure container window is raised and Kate has focus
-    if (display && containerWindow && !isMinimized) {
-        suppressErrors = YES;  // Suppress errors during focus operations
+    if (display && containerWindow && !isMinimized && embedded) {
+        suppressErrors = YES;
         
         XRaiseWindow(display, containerWindow);
         
@@ -913,9 +977,6 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     // Show window
     [mainWindow makeKeyAndOrderFront:nil];
     
-    // Force initial positioning
-    [embedView updateContainerPosition];
-    
     // Launch Kate after a small delay
     [embedView performSelector:@selector(launchKate) 
                      withObject:nil 
@@ -960,7 +1021,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
             if (kateWin && event.xdestroywindow.window == kateWin) {
                 NSLog(@"Kate window destroyed - closing wrapper");
                 [embedView handleKateWindowDestroyed];
-                break;  // Exit the event loop since we're closing
+                break;
             }
         }
         // Also check for UnmapNotify which might indicate Kate is closing
