@@ -36,7 +36,6 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     int searchAttempts;
     NSPoint lastPosition;
     NSSize lastSize;
-    BOOL isMoving;
 }
 - (id)initWithFrame:(NSRect)frame;
 - (void)embedWindow:(Window)window;
@@ -46,8 +45,8 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 - (void)setupContainerWindow;
 - (void)updateContainerPosition;
 - (void)findAndEmbedKateWindow;
-- (void)windowWillMove:(NSNotification *)notification;
-- (void)windowDidMove:(NSNotification *)notification;
+- (void)windowIsMoving:(NSNotification *)notification;
+- (void)windowIsResizing:(NSNotification *)notification;
 - (void)windowDidResize:(NSNotification *)notification;
 @end
 
@@ -60,7 +59,6 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
         embedded = NO;
         searchAttempts = 0;
         kateWindow = 0;
-        isMoving = NO;
         lastPosition = NSMakePoint(-1, -1);
         lastSize = NSMakeSize(0, 0);
         
@@ -91,14 +89,9 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     [super viewDidMoveToWindow];
     
     if ([self window]) {
-        // Register for window movement notifications
+        // Register for live window movement notifications
         [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(windowWillMove:)
-                                                     name:NSWindowWillMoveNotification
-                                                   object:[self window]];
-        
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(windowDidMove:)
+                                                 selector:@selector(windowIsMoving:)
                                                      name:NSWindowDidMoveNotification
                                                    object:[self window]];
         
@@ -106,29 +99,25 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
                                                  selector:@selector(windowDidResize:)
                                                      name:NSWindowDidResizeNotification
                                                    object:[self window]];
+        
+        // Also listen for live resize
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(windowIsResizing:)
+                                                     name:NSWindowDidUpdateNotification
+                                                   object:[self window]];
     }
 }
 
-- (void)windowWillMove:(NSNotification *)notification
+- (void)windowIsMoving:(NSNotification *)notification
 {
-    isMoving = YES;
-    // Hide the Kate window during move to prevent ghost window
-    if (kateWindow && embedded) {
-        XUnmapWindow(display, kateWindow);
-        XFlush(display);
-    }
-}
-
-- (void)windowDidMove:(NSNotification *)notification
-{
-    isMoving = NO;
+    // Update position immediately during movement
     [self updateContainerPosition];
-    
-    // Remap the Kate window after move
-    if (kateWindow && embedded) {
-        XMapWindow(display, kateWindow);
-        XFlush(display);
-    }
+}
+
+- (void)windowIsResizing:(NSNotification *)notification
+{
+    // Update during live resize
+    [self updateContainerPosition];
 }
 
 - (void)windowDidResize:(NSNotification *)notification
@@ -199,15 +188,12 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 
 - (void)updateContainerPosition
 {
-    if (!containerWindow || isMoving) return;
+    if (!containerWindow) return;
     
     // Get screen position of this view
     NSWindow *window = [self window];
     NSRect frameInWindow = [self convertRect:[self bounds] toView:nil];
     NSRect frameOnScreen = [window convertRectToScreen:frameInWindow];
-    
-    lastPosition = frameOnScreen.origin;
-    lastSize = frameOnScreen.size;
     
     // Get root window attributes for coordinate conversion
     Window root = DefaultRootWindow(display);
@@ -229,21 +215,30 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     unsigned int mask = CWX | CWY | CWWidth | CWHeight | CWStackMode;
     
     suppressErrors = YES;
+    
+    // Move container window smoothly
     XConfigureWindow(display, containerWindow, mask, &changes);
     
-    // Ensure it's mapped and visible
-    XMapRaised(display, containerWindow);
+    // Keep it mapped and visible
+    if (!embedded || kateWindow == 0) {
+        XMapRaised(display, containerWindow);
+    }
     
-    // Update Kate window size if embedded
+    // Update Kate window size if embedded - but keep it mapped
     if (kateWindow && embedded) {
         changes.x = 0;
         changes.y = 0;
         XConfigureWindow(display, kateWindow, CWX | CWY | CWWidth | CWHeight, &changes);
+        // Ensure Kate stays visible
+        XMapWindow(display, kateWindow);
     }
     
-    // Force immediate update
-    XSync(display, False);
+    // Flush changes immediately for smooth movement
+    XFlush(display);
     suppressErrors = NO;
+    
+    lastPosition = frameOnScreen.origin;
+    lastSize = frameOnScreen.size;
 }
 
 - (void)drawRect:(NSRect)rect
@@ -251,9 +246,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
     [[NSColor darkGrayColor] set];
     NSRectFill(rect);
     
-    if (!isMoving) {
-        [self updateContainerPosition];
-    }
+    [self updateContainerPosition];
     
     [super drawRect:rect];
 }
@@ -492,9 +485,7 @@ int x11ErrorHandler(Display *dpy, XErrorEvent *err)
 - (void)setFrame:(NSRect)frame
 {
     [super setFrame:frame];
-    if (!isMoving) {
-        [self updateContainerPosition];
-    }
+    [self updateContainerPosition];
 }
 
 - (BOOL)acceptsFirstResponder
